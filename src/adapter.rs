@@ -1,6 +1,10 @@
-use deku::prelude::*;
 use rusb::{DeviceHandle, GlobalContext};
-use std::{convert::TryFrom, fmt::Debug, thread, time::Duration};
+use std::{
+    convert::{TryFrom, TryInto},
+    fmt::Debug,
+    thread,
+    time::Duration,
+};
 
 const ENDPOINT_IN: u8 = 0x81;
 const ENDPOINT_OUT: u8 = 0x02;
@@ -73,78 +77,100 @@ impl GcAdapter {
     }
 }
 
-#[derive(Debug, PartialEq, DekuRead)]
+#[derive(Debug)]
 pub struct AdapterState {
-    unknown: u8,
-    pub controller_0: ControllerState,
-    pub controller_1: ControllerState,
-    pub controller_2: ControllerState,
-    pub controller_3: ControllerState,
+    pub buf: [u8; READ_LEN],
 }
 
 impl AdapterState {
     pub const fn new() -> Self {
-        Self {
-            unknown: 0,
-            controller_0: ControllerState::new(),
-            controller_1: ControllerState::new(),
-            controller_2: ControllerState::new(),
-            controller_3: ControllerState::new(),
-        }
+        AdapterState { buf: [0; READ_LEN] }
     }
 
     /// Get the `ControllerState` for the given channel
-    pub fn controller_state(&self, channel: Channel) -> ControllerState {
-        match channel {
-            Channel::One => self.controller_0,
-            Channel::Two => self.controller_1,
-            Channel::Three => self.controller_2,
-            Channel::Four => self.controller_3,
+    pub fn controller_state<T>(&self, channel: T) -> ControllerState
+    where
+        T: TryInto<Channel>,
+        <T as TryInto<Channel>>::Error: Debug,
+    {
+        let channel = channel.try_into().unwrap() as usize;
+
+        if let [status, b1, b2, stick_x, stick_y, substick_x, substick_y, trigger_left, trigger_right, ..] =
+            self.buf[(9 * channel) + 1..]
+        {
+            ControllerState {
+                connected: is_controller_connected(status),
+
+                a: b1 & (1 << 0) > 0,
+                b: b1 & (1 << 1) > 0,
+                x: b1 & (1 << 2) > 0,
+                y: b1 & (1 << 3) > 0,
+
+                left: b1 & (1 << 4) > 0,
+                right: b1 & (1 << 5) > 0,
+                down: b1 & (1 << 6) > 0,
+                up: b1 & (1 << 7) > 0,
+
+                start: b2 & (1 << 0) > 0,
+                z: b2 & (1 << 1) > 0,
+                r: b2 & (1 << 2) > 0,
+                l: b2 & (1 << 3) > 0,
+
+                stick_x,
+                stick_y,
+                substick_x,
+                substick_y,
+                trigger_left,
+                trigger_right,
+            }
+        } else {
+            unreachable!();
         }
     }
 
+    /// Check if a controller is connected to the given channel.
+    pub fn is_connected<T>(&self, channel: T) -> bool
+    where
+        T: TryInto<Channel>,
+        <T as TryInto<Channel>>::Error: Debug,
+    {
+        let channel = channel.try_into().unwrap();
+
+        let status = self.buf[1 + (9 * channel as usize)] >> 4;
+        is_controller_connected(status)
+    }
+
     pub fn any_connected(&self) -> bool {
-        self.controller_0.is_connected()
-            || self.controller_1.is_connected()
-            || self.controller_2.is_connected()
-            || self.controller_3.is_connected()
+        (0..4)
+            .map(|i| self.is_connected(i))
+            .any(std::convert::identity)
     }
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, DekuRead)]
-#[deku(endian = "little")]
-pub struct ControllerState {
-    pub status: u8,
+impl Default for AdapterState {
+    fn default() -> Self {
+        AdapterState::new()
+    }
+}
 
-    #[deku(bits = "1")]
+#[derive(Debug, Default, Copy, Clone)]
+pub struct ControllerState {
+    pub connected: bool,
+
     pub a: bool,
-    #[deku(bits = "1")]
     pub b: bool,
-    #[deku(bits = "1")]
     pub x: bool,
-    #[deku(bits = "1")]
     pub y: bool,
 
-    #[deku(bits = "1")]
     pub left: bool,
-    #[deku(bits = "1")]
     pub right: bool,
-    #[deku(bits = "1")]
     pub down: bool,
-    #[deku(bits = "1")]
     pub up: bool,
 
-    #[deku(bits = "1")]
     pub start: bool,
-    #[deku(bits = "1")]
     pub z: bool,
-    #[deku(bits = "1")]
     pub r: bool,
-    #[deku(bits = "1")]
     pub l: bool,
-
-    #[deku(bits = "4")]
-    b2_rest: u8,
 
     pub stick_x: u8,
     pub stick_y: u8,
@@ -155,31 +181,6 @@ pub struct ControllerState {
 }
 
 impl ControllerState {
-    pub const fn new() -> Self {
-        Self {
-            status: 0,
-            a: false,
-            b: false,
-            x: false,
-            y: false,
-            left: false,
-            right: false,
-            down: false,
-            up: false,
-            start: false,
-            z: false,
-            r: false,
-            l: false,
-            b2_rest: 0,
-            stick_x: 0,
-            stick_y: 0,
-            substick_x: 0,
-            substick_y: 0,
-            trigger_left: 0,
-            trigger_right: 0,
-        }
-    }
-
     pub fn stick_with_deadzone(&self, deadzone: u8, sensitivity: u8) -> (i8, i8) {
         const STICK_MAX: i32 = i8::MAX as i32;
 
@@ -226,13 +227,13 @@ impl ControllerState {
 
         (x, y)
     }
+}
 
-    pub fn is_connected(&self) -> bool {
-        // 0x10 = Normal
-        // 0x20 = Wavebird
-        let controller_type = self.status & (0x10 | 0x20);
-        controller_type == 0x10 || controller_type == 0x20
-    }
+fn is_controller_connected(status: u8) -> bool {
+    // 0x10 = Normal
+    // 0x20 = Wavebird
+    let controller_type = status & (0x10 | 0x20);
+    controller_type == 0x10 || controller_type == 0x20
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -277,15 +278,8 @@ mod tests {
 
     #[test]
     fn test_adapter_state() {
-        let data: [u8; READ_LEN] = [
-            0x0, 0x1, 0b10010110, 0b11110110, 0x5, 0x6, 0x7, 0x8, 0x9, 0xA, 0x2, 0b10010110,
-            0b11110110, 0x5, 0x6, 0x7, 0x8, 0x9, 0xA, 0x3, 0b10010110, 0b11110110, 0x5, 0x6, 0x7,
-            0x8, 0x9, 0xA, 0x4, 0b10010110, 0b11110110, 0x5, 0x6, 0x7, 0x8, 0x9, 0xA,
-        ];
-        let (_rest, state) = AdapterState::from_bytes((&data, 0)).unwrap();
-        assert_eq!(state.controller_0.status, 0x1);
-        assert_eq!(state.controller_1.status, 0x2);
-        assert_eq!(state.controller_2.status, 0x3);
-        assert_eq!(state.controller_3.status, 0x4);
+        let data: Vec<u8> = (0..READ_LEN as u8).collect();
+        let mut state = AdapterState::new();
+        state.buf.copy_from_slice(&data);
     }
 }

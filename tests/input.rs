@@ -1,15 +1,10 @@
-use deku::DekuContainerRead;
 use mupen64plus_input_gca::adapter::{AdapterState, ControllerState, GcAdapter};
 use std::time::{Duration, Instant};
 
-fn all_controller_states(state: &AdapterState) -> impl Iterator<Item = ControllerState> {
-    [
-        state.controller_0,
-        state.controller_1,
-        state.controller_2,
-        state.controller_3,
-    ]
-    .into_iter()
+fn all_controller_states<'a>(
+    state: &'a AdapterState,
+) -> impl Iterator<Item = ControllerState> + 'a {
+    (0..4).map(move |i| state.controller_state(i))
 }
 
 fn any(state: ControllerState) -> bool {
@@ -19,7 +14,7 @@ fn any(state: ControllerState) -> bool {
     const TRIGGER_THRESHOLD: u8 = 168;
     let (stick_x, stick_y) = state.stick_with_deadzone(CONTROL_DEADZONE, CONTROL_SENSITIVITY);
     let (substick_x, substick_y) = state.substick_with_deadzone(C_DEADZONE);
-    state.is_connected()
+    state.connected
         && (state.a
             || state.b
             || state.x
@@ -47,9 +42,10 @@ fn receives_input() {
     let adapter = GcAdapter::new().expect(ERR);
     let started = Instant::now();
 
-    let (_rest, state) = AdapterState::from_bytes((&adapter.read().unwrap(), 0)).unwrap();
+    let mut state = AdapterState::new();
+    state.buf = adapter.read().unwrap();
 
-    if !state.any_connected() {
+    if !(0..4).map(|i| state.is_connected(i)).any(|b| b) {
         eprintln!("no controllers detected, but might be a false negative");
     }
 
@@ -59,13 +55,13 @@ fn receives_input() {
             break;
         }
 
-        let (_rest, state) = AdapterState::from_bytes((&adapter.read().unwrap(), 0)).unwrap();
-        for (i, s) in (0..4)
-            .zip(all_controller_states(&state))
-            .filter(|(_, s)| any(*s))
+        state.buf = adapter.read().unwrap();
+        if let Some((i, _)) = (0..4)
+            .map(|i| (i, any(state.controller_state(i))))
+            .find(|(_, a)| *a)
         {
             any_input = true;
-            println!("Channel {i}: {s:?}");
+            println!("Channel {}: {:?}", i, state.controller_state(i));
         }
     }
 
